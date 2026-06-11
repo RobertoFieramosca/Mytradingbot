@@ -135,45 +135,90 @@ def poll_telegram_commands():
         print(f"Command poll error: {e}")
 
 # ─── TWELVE DATA ──────────────────────────────────────────────────────────────
-def get_quotes_twelvedata(symbols: list) -> dict:
-    """
-    Batch quote from Twelve Data.
-    Returns {symbol: {c, pc, h, l, pct}} for each symbol.
-    Free plan: 800 calls/day, batch up to 120 symbols per call.
-    """
-    result = {s: {} for s in symbols}
-    CHUNK = 50  # safe batch size
+# Twelve Data exchange code alternatives to try
+TD_EXCHANGE_FALLBACKS = {
+    "RMS:XPAR":   ["RMS:EPA",  "RMS:PAR"],
+    "AIR:XPAR":   ["AIR:EPA",  "AIR:PAR"],
+    "MC:XPAR":    ["MC:EPA",   "MC:PAR"],
+    "UCG:XMIL":   ["UCG:MIL",  "UCG:BIT"],
+    "EL:XPAR":    ["EL:EPA",   "EL:PAR"],
+    "CDI:XPAR":   ["CDI:EPA",  "CDI:PAR"],
+    "ADYEN:XAMS": ["ADYEN:AMS","ADYEN:XAMS"],
+    "DSY:XPAR":   ["DSY:EPA",  "DSY:PAR"],
+    "ENGI:XPAR":  ["ENGI:EPA", "ENGI:PAR"],
+    "DTE:XETR":   ["DTE:FRA",  "DTE:XETRA", "DTE:ETR"],
+    "ISP:XMIL":   ["ISP:MIL",  "ISP:BIT"],
+    "SU:XPAR":    ["SU:EPA",   "SU:PAR"],
+    "ENR:XETR":   ["ENR:FRA",  "ENR:XETRA", "ENR:ETR"],
+}
 
-    for i in range(0, len(symbols), CHUNK):
-        chunk = symbols[i:i+CHUNK]
-        sym_str = ",".join(chunk)
+def _td_fetch_one(symbol: str) -> dict:
+    """Fetch a single symbol from Twelve Data with fallback formats."""
+    symbols_to_try = [symbol] + TD_EXCHANGE_FALLBACKS.get(symbol, [])
+    for sym in symbols_to_try:
         try:
             r = requests.get(
-                f"https://api.twelvedata.com/quote"
-                f"?symbol={sym_str}&apikey={TWELVEDATA_KEY}",
-                timeout=15
+                f"https://api.twelvedata.com/quote?symbol={sym}&apikey={TWELVEDATA_KEY}",
+                timeout=12
             ).json()
-
-            # If single symbol, response is dict not nested
-            if "symbol" in r:
-                r = {r["symbol"]: r}
-
-            for sym, data in r.items():
-                if data.get("status") == "error":
-                    print(f"TD error for {sym}: {data.get('message')}")
-                    continue
-                try:
-                    result[sym] = {
-                        "c":   round(float(data.get("close") or 0), 4),
-                        "pc":  round(float(data.get("previous_close") or 0), 4),
-                        "h":   round(float(data.get("high") or 0), 4),
-                        "l":   round(float(data.get("low") or 0), 4),
-                        "pct": round(float(data.get("percent_change") or 0), 2),
-                    }
-                except Exception as e:
-                    print(f"TD parse error {sym}: {e}")
+            if r.get("status") == "error":
+                print(f"TD {sym}: {r.get('message','error')}")
+                continue
+            c  = float(r.get("close") or 0)
+            pc = float(r.get("previous_close") or 0)
+            h  = float(r.get("high") or 0)
+            l  = float(r.get("low") or 0)
+            if c > 0:
+                print(f"TD OK {sym}: close={c}")
+                return {"c": round(c,4), "pc": round(pc,4), "h": round(h,4), "l": round(l,4)}
         except Exception as e:
-            print(f"TD batch error: {e}")
+            print(f"TD fetch error {sym}: {e}")
+    print(f"TD FAILED all formats for {symbol}")
+    return {}
+
+def get_quotes_twelvedata(symbols: list) -> dict:
+    """
+    Fetch quotes from Twelve Data.
+    US stocks: batch call (efficient).
+    EU stocks (with exchange code): individual calls with fallback formats.
+    """
+    result    = {s: {} for s in symbols}
+    us_syms   = [s for s in symbols if ":" not in s]
+    eu_syms   = [s for s in symbols if ":" in s]
+
+    # Batch US stocks
+    if us_syms:
+        CHUNK = 40
+        for i in range(0, len(us_syms), CHUNK):
+            chunk   = us_syms[i:i+CHUNK]
+            sym_str = ",".join(chunk)
+            try:
+                r = requests.get(
+                    f"https://api.twelvedata.com/quote?symbol={sym_str}&apikey={TWELVEDATA_KEY}",
+                    timeout=15
+                ).json()
+                if "symbol" in r:  # single symbol response
+                    r = {r["symbol"]: r}
+                for sym, data in r.items():
+                    if isinstance(data, dict) and data.get("status") != "error":
+                        c  = float(data.get("close") or 0)
+                        pc = float(data.get("previous_close") or 0)
+                        if c > 0:
+                            result[sym] = {
+                                "c":  round(c, 4),
+                                "pc": round(pc, 4),
+                                "h":  round(float(data.get("high") or 0), 4),
+                                "l":  round(float(data.get("low") or 0), 4),
+                            }
+                    else:
+                        print(f"TD US error {sym}: {data}")
+            except Exception as e:
+                print(f"TD US batch error: {e}")
+            time.sleep(0.3)
+
+    # EU stocks: individual calls with fallbacks
+    for sym in eu_syms:
+        result[sym] = _td_fetch_one(sym)
         time.sleep(0.2)
 
     return result
