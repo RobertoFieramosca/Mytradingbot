@@ -3,3 +3,4 @@ requests
 schedule
 pytz
 websocket-client
+yfinance
