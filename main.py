@@ -144,7 +144,7 @@ def claude_analyze(prompt: str) -> str:
     client = anthropic.Anthropic(api_key=CLAUDE_KEY)
     try:
         msg = client.messages.create(
-            model="claude-sonnet-4-20250514",
+            model="claude-sonnet-4-6",
             max_tokens=1000,
             messages=[{"role": "user", "content": prompt}]
         )
@@ -259,7 +259,7 @@ def is_breaking_news(headline: str, summary: str) -> bool:
     client = anthropic.Anthropic(api_key=CLAUDE_KEY)
     try:
         msg = client.messages.create(
-            model="claude-sonnet-4-20250514",
+            model="claude-sonnet-4-6",
             max_tokens=10,
             messages=[{
                 "role": "user",
