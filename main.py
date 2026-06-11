@@ -25,6 +25,7 @@ import requests
 import schedule
 import anthropic
 import websocket
+import yfinance as yf
 from collections import deque
 from datetime import datetime, date, timedelta
 import pytz
@@ -41,37 +42,40 @@ DAY_THRESHOLD   = 2.5   # % daily move to highlight in summary
 
 QUANTUM_STOCKS  = {"IONQ", "QBTS", "RGTI"}
 
-# Roberto's portfolio — Finnhub symbol: display name
-PORTFOLIO = {
-    "ASML":     "ASML",
-    "MSFT":     "Microsoft",
-    "GOOGL":    "Alphabet",
-    "RMS.PA":   "Hermès",
-    "AIR.PA":   "Airbus",
-    "MC.PA":    "LVMH",
-    "UCG.MI":   "UniCredit",
-    "EL.PA":    "EssilorLuxottica",
-    "CDI.PA":   "Christian Dior",
-    "ADYEN.AS": "Adyen",
-    "DSY.PA":   "Dassault Systèmes",
-    "SAP":      "SAP",
-    "ENGI.PA":  "Engie",
-    "DTE.DE":   "Deutsche Telekom",
-    "ISP.MI":   "Intesa Sanpaolo",
-    "SONY":     "Sony",
-    "TSM":      "Taiwan Semi",
-    "RACE":     "Ferrari",
-    "ONON":     "ON Holding",
-    "SU.PA":    "Schneider Electric",
-    "SPOT":     "Spotify",
-    "IONQ":     "IonQ",
-    "QBTS":     "D-Wave",
-    "RGTI":     "Rigetti",
-    "ENR.DE":   "Siemens Energy",
-    "ASMIY":    "ASM International",
-    "AMAT":     "Applied Materials",
-    "AVGO":     "Broadcom",
+# Roberto's portfolio — Finnhub symbol: (display name, sector)
+PORTFOLIO_DATA = {
+    "ASML":     ("ASML",              "Semiconduttori"),
+    "MSFT":     ("Microsoft",         "Tech"),
+    "GOOGL":    ("Alphabet",          "Tech"),
+    "RMS.PA":   ("Hermès",            "Lusso & Fashion"),
+    "AIR.PA":   ("Airbus",            "Industriale"),
+    "MC.PA":    ("LVMH",              "Lusso & Fashion"),
+    "UCG.MI":   ("UniCredit",         "Finance"),
+    "EL.PA":    ("EssilorLuxottica",  "Lusso & Fashion"),
+    "CDI.PA":   ("Christian Dior",    "Lusso & Fashion"),
+    "ADYEN.AS": ("Adyen",             "Tech"),
+    "DSY.PA":   ("Dassault Systèmes", "Tech"),
+    "SAP":      ("SAP",               "Tech"),
+    "ENGI.PA":  ("Engie",             "Energia"),
+    "DTE.DE":   ("Deutsche Telekom",  "Telecom"),
+    "ISP.MI":   ("Intesa Sanpaolo",   "Finance"),
+    "SONY":     ("Sony",              "Consumer Tech"),
+    "TSM":      ("Taiwan Semi",       "Semiconduttori"),
+    "RACE":     ("Ferrari",           "Consumer"),
+    "ONON":     ("ON Holding",        "Consumer"),
+    "SU.PA":    ("Schneider Electric","Industriale"),
+    "SPOT":     ("Spotify",           "Tech"),
+    "IONQ":     ("IonQ",              "Quantum"),
+    "QBTS":     ("D-Wave",            "Quantum"),
+    "RGTI":     ("Rigetti",           "Quantum"),
+    "ENR.DE":   ("Siemens Energy",    "Energia"),
+    "ASMIY":    ("ASM International", "Semiconduttori"),
+    "AMAT":     ("Applied Materials", "Semiconduttori"),
+    "AVGO":     ("Broadcom",          "Semiconduttori"),
 }
+
+# Flat name lookup for compatibility
+PORTFOLIO = {k: v[0] for k, v in PORTFOLIO_DATA.items()}
 
 # Rolling price history for velocity alerts
 price_history: dict  = {s: deque(maxlen=500) for s in PORTFOLIO}
@@ -94,11 +98,38 @@ def send_telegram(message: str):
 
 # ─── FINNHUB REST ──────────────────────────────────────────────────────────────
 def get_quote(symbol: str) -> dict:
-    url = f"https://finnhub.io/api/v1/quote?symbol={symbol}&token={FINNHUB_KEY}"
+    """Get current quote using yfinance — works for all global markets."""
     try:
-        return requests.get(url, timeout=10).json()
-    except:
+        fi = yf.Ticker(symbol).fast_info
+        return {
+            "c":  round(float(fi.last_price), 4)      if fi.last_price      else 0,
+            "pc": round(float(fi.previous_close), 4)  if fi.previous_close  else 0,
+            "h":  round(float(fi.day_high), 4)         if fi.day_high        else 0,
+            "l":  round(float(fi.day_low), 4)          if fi.day_low         else 0,
+        }
+    except Exception as e:
+        print(f"yfinance error for {symbol}: {e}")
         return {}
+
+def get_quote_batch(symbols: list) -> dict:
+    """Batch fetch quotes for multiple symbols — more efficient."""
+    result = {}
+    try:
+        tickers = yf.Tickers(" ".join(symbols))
+        for symbol in symbols:
+            try:
+                fi = tickers.tickers[symbol].fast_info
+                result[symbol] = {
+                    "c":  round(float(fi.last_price), 4)     if fi.last_price     else 0,
+                    "pc": round(float(fi.previous_close), 4) if fi.previous_close else 0,
+                    "h":  round(float(fi.day_high), 4)        if fi.day_high       else 0,
+                    "l":  round(float(fi.day_low), 4)         if fi.day_low        else 0,
+                }
+            except:
+                result[symbol] = {}
+    except Exception as e:
+        print(f"Batch quote error: {e}")
+    return result
 
 def get_market_news() -> list:
     url = f"https://finnhub.io/api/v1/news?category=general&token={FINNHUB_KEY}"
@@ -245,12 +276,12 @@ def start_websocket_thread():
 
 # ─── EU STOCKS POLLING (every 5 min) ──────────────────────────────────────────
 def poll_eu_stocks():
-    for symbol in PORTFOLIO:
-        if "." in symbol:
-            q = get_quote(symbol)
-            c = q.get("c", 0)
-            if c:
-                process_price(symbol, c)
+    eu_symbols = [s for s in PORTFOLIO if "." in s]
+    quotes = get_quote_batch(eu_symbols)
+    for symbol in eu_symbols:
+        c = quotes.get(symbol, {}).get("c", 0)
+        if c:
+            process_price(symbol, c)
 
 # ─── NEWS ALERTS ──────────────────────────────────────────────────────────────
 def is_breaking_news(headline: str, summary: str) -> bool:
@@ -315,13 +346,16 @@ def check_news_alerts():
 def morning_briefing():
     print("Generating morning briefing...")
 
-    lines = []
+    quotes    = get_quote_batch(list(PORTFOLIO.keys()))
+    lines     = []
     for symbol, name in PORTFOLIO.items():
-        q = get_quote(symbol)
+        q = quotes.get(symbol, {})
         c, pc = q.get("c", 0), q.get("pc", 0)
         if c and pc:
             pct = (c - pc) / pc * 100
             lines.append(f"{name}: {c:.2f} ({pct:+.1f}%)")
+        else:
+            lines.append(f"{name}: N/A")
 
     portfolio_str = "\n".join(lines) or "N/A"
     news_str      = "\n".join(f"- {n['headline']}" for n in get_market_news()[:6])
@@ -354,14 +388,17 @@ In italiano. Nessun fronzolo."""
 def ny_summary():
     print("Generating NY summary...")
 
-    lines = []
+    quotes = get_quote_batch(list(PORTFOLIO.keys()))
+    lines  = []
     for symbol, name in PORTFOLIO.items():
-        q = get_quote(symbol)
+        q = quotes.get(symbol, {})
         c, pc = q.get("c", 0), q.get("pc", 0)
         if c and pc:
             pct = (c - pc) / pc * 100
-            icon = "📈" if pct > 0 else "📉" if pct < 0 else "➡️"
-            lines.append(f"{icon} {name}: {c:.2f} ({pct:+.1f}%)")
+            icon = "+" if pct > 0 else ""
+            lines.append(f"{name}: {c:.2f} ({icon}{pct:.1f}%)")
+        else:
+            lines.append(f"{name}: N/A")
 
     portfolio_str = "\n".join(lines) or "N/A"
 
@@ -385,30 +422,45 @@ In italiano. Solo i fatti."""
 def eu_close_summary():
     print("Generating EU close summary...")
 
-    # Collect portfolio data
-    portfolio_data = []
-    big_movers     = []   # > DAY_THRESHOLD %
-    new_extremes   = []   # 52w high/low
+    # Collect portfolio data grouped by sector
+    from collections import defaultdict
+    sector_data = defaultdict(list)
+    big_movers  = []
+    all_lines   = []
 
-    for symbol, name in PORTFOLIO.items():
-        q   = get_quote(symbol)
-        c   = q.get("c", 0)
-        pc  = q.get("pc", 0)
-        h   = q.get("h", 0)   # today's high
-        l   = q.get("l", 0)   # today's low
-        h52 = q.get("t", 0)   # Finnhub doesn't give 52w directly; use as timestamp placeholder
+    quotes = get_quote_batch(list(PORTFOLIO_DATA.keys()))
+    for symbol, (name, sector) in PORTFOLIO_DATA.items():
+        q  = quotes.get(symbol, {})
+        c  = q.get("c", 0)
+        pc = q.get("pc", 0)
 
-        if not c or not pc:
-            continue
+        if c and pc:
+            pct  = (c - pc) / pc * 100
+            icon = "+" if pct > 0 else ""
+            line = f"{name}: {c:.2f} ({icon}{pct:.1f}%)"
+            sector_data[sector].append((name, pct, line))
+            all_lines.append(line)
+            if abs(pct) >= DAY_THRESHOLD:
+                direction = "SU" if pct > 0 else "GIU"
+                big_movers.append(f"<b>{name}</b> {icon}{pct:.1f}% ({direction})")
+        else:
+            sector_data[sector].append((name, None, f"{name}: N/A"))
+            all_lines.append(f"{name}: N/A")
 
-        pct  = (c - pc) / pc * 100
-        icon = "📈" if pct > 0 else "📉" if pct < 0 else "➡️"
-        portfolio_data.append(f"{icon} {name}: {c:.2f} ({pct:+.1f}%)")
+    # Build sector summary
+    sector_lines = []
+    for sector, stocks in sector_data.items():
+        valid = [(n, p, l) for n, p, l in stocks if p is not None]
+        if valid:
+            avg = sum(p for _, p, _ in valid) / len(valid)
+            trend = "▲" if avg > 0.3 else "▼" if avg < -0.3 else "—"
+            details = ", ".join(l for _, _, l in stocks)
+            sector_lines.append(f"{trend} {sector}: {details}")
+        else:
+            details = ", ".join(l for _, _, l in stocks)
+            sector_lines.append(f"— {sector}: {details}")
 
-        # Flag big daily movers
-        if abs(pct) >= DAY_THRESHOLD:
-            flag = "🔺" if pct > 0 else "🔻"
-            big_movers.append(f"{flag} <b>{name}</b> {pct:+.1f}%")
+    portfolio_str = "\n".join(sector_lines)
 
     # Earnings tomorrow
     earnings = get_earnings_calendar()
@@ -435,15 +487,29 @@ def eu_close_summary():
     # Market news
     news_str = "\n".join(f"- {n['headline']}" for n in get_market_news()[:6])
 
-    portfolio_str  = "\n".join(portfolio_data) or "N/A"
     big_movers_str = "\n".join(big_movers) or "Nessun movimento superiore al 2.5%"
+
+    # Build sector averages
+    sector_avgs = {}
+    for sector, stocks in sector_data.items():
+        valid_pcts = [p for _, p, _ in stocks if p is not None]
+        if valid_pcts:
+            sector_avgs[sector] = sum(valid_pcts) / len(valid_pcts)
+
+    sector_avg_str = "\n".join(
+        f"  {sector}: {avg:+.2f}%"
+        for sector, avg in sorted(sector_avgs.items(), key=lambda x: x[1], reverse=True)
+    )
 
     prompt = f"""Sei l'assistente trading di Roberto. Sono le 17:30, i mercati europei hanno chiuso.
 
-PERFORMANCE PORTAFOGLIO OGGI:
+PORTAFOGLIO PER SETTORE (dati reali):
 {portfolio_str}
 
-MOVIMENTI SIGNIFICATIVI (>±2.5%):
+MEDIE SETTORIALI GIORNALIERE:
+{sector_avg_str}
+
+MOVERS >±2.5%:
 {big_movers_str}
 
 NEWS DEL GIORNO:
@@ -452,21 +518,34 @@ NEWS DEL GIORNO:
 EARNINGS CALL DOMANI — TUOI TITOLI:
 {earnings_portfolio_str}
 
-EARNINGS CALL DOMANI — ALTRI TITOLI DI RILIEVO:
+EARNINGS CALL DOMANI — ALTRI:
 {earnings_other_str}
 
-Scrivi UN messaggio Telegram (max 400 parole). Tono professionale, da analista senior.
-Niente emoji eccessive. Usa il grassetto HTML <b>...</b> per i numeri importanti e i titoli che si muovono oltre 2.5%.
+Scrivi UN messaggio Telegram (max 450 parole). Tono professionale, da analista senior.
+Usa <b>grassetto</b> per titoli con movimento >2.5% e per i nomi sezione.
+STRUTTURA FISSA — rispetta sempre questo ordine:
 
-CHIUSURA EU — sentiment generale con i dati principali degli indici
-MOVERS DEL GIORNO — titoli con movimento >2.5% in grassetto, con breve spiegazione della causa
-NEWS CHIAVE — 2-3 notizie rilevanti di giornata
-EARNINGS DOMANI — se Roberto ha titoli con earnings call domani, segnalarlo chiaramente con suggerimento; poi altri titoli importanti
-STOCK DA GUARDARE — 1-2 titoli interessanti fuori portafoglio
-TAKEAWAY — 1-2 osservazioni chiave, dirette
-DOMANI — 1 cosa concreta da monitorare
+<b>Chiusura EU</b> — 2 righe sentiment generale mercati europei oggi
 
-In italiano. Nessun fronzolo, nessuna esclamazione."""
+<b>Trend Settoriali</b> — SEMPRE presenti, SEMPRE in questo ordine, con trend e numeri:
+  Lusso e Fashion (Hermes, LVMH, Dior, EssilorLuxottica)
+  Tech (Microsoft, Alphabet, SAP, Dassault, Adyen, Spotify)
+  Semiconduttori (ASML, ASM, TSMC, AMAT, Broadcom)
+  Quantum (IonQ, D-Wave, Rigetti)
+  Finance (UniCredit, Intesa)
+  Energia (Engie, Siemens Energy)
+  Industriale (Airbus, Schneider)
+  Per ogni settore: trend su/giu/flat + media % + titolo piu rilevante
+
+<b>Movers del Giorno</b> — solo titoli >2.5%, in grassetto, con causa in una riga
+
+<b>Earnings Domani</b> — titoli di Roberto (suggerisci se valutare uscita), poi altri importanti
+
+<b>Stock da Guardare</b> — 1 titolo fuori portafoglio interessante
+
+<b>Domani</b> — 1 cosa concreta da monitorare
+
+In italiano. Solo i fatti."""
 
     send_telegram(f"🇪🇺 <b>CHIUSURA EU</b>\n\n{claude_analyze(prompt)}")
 
