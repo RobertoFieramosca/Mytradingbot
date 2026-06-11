@@ -128,57 +128,58 @@ def poll_telegram_commands():
         print(f"Command poll error: {e}")
 
 # ─── TWELVE DATA ──────────────────────────────────────────────────────────────
-# ─── YAHOO FINANCE HTTP (all prices) ─────────────────────────────────────────
-YF_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    "Accept": "application/json",
-}
+# ─── YFINANCE (all prices, correct native currency) ──────────────────────────
+import yfinance as yf
+from concurrent.futures import ThreadPoolExecutor
+from datetime import timezone
 
-def get_quotes_yahoo(symbols: list) -> dict:
+def _fetch_yf_one(symbol: str) -> tuple:
     """
-    Batch quote via Yahoo Finance v7 API.
-    Covers all markets: US, EU (Paris, Milan, Frankfurt, Amsterdam).
-    Returns prices in each stock's native currency.
+    Fetch one symbol using yfinance history() — always returns native currency.
+    RMS.PA → EUR, MSFT → USD, DTE.DE → EUR etc.
     """
-    result  = {s: {} for s in symbols}
-    CHUNK   = 20
+    try:
+        ticker = yf.Ticker(symbol)
+        # 2 days of 1-min bars: gives today's intraday OHLC + yesterday's close
+        hist = ticker.history(period="2d", interval="1m", auto_adjust=False)
+        if hist.empty:
+            print(f"YF empty for {symbol}")
+            return (symbol, {})
 
-    for i in range(0, len(symbols), CHUNK):
-        chunk   = symbols[i:i+CHUNK]
-        sym_str = ",".join(chunk)
-        try:
-            r = requests.get(
-                f"https://query2.finance.yahoo.com/v7/finance/quote?symbols={sym_str}",
-                headers=YF_HEADERS, timeout=15
-            ).json()
+        hist.index = hist.index.tz_localize(None) if hist.index.tzinfo is None else hist.index.tz_convert(None)
+        today_date = datetime.utcnow().date()
 
-            for item in r.get("quoteResponse", {}).get("result", []):
-                sym = item.get("symbol", "")
-                c   = item.get("regularMarketPrice", 0)
-                pc  = item.get("regularMarketPreviousClose", 0)
-                h   = item.get("regularMarketDayHigh", 0)
-                l   = item.get("regularMarketDayLow", 0)
-                cur = item.get("currency", "")
-                if c and pc:
-                    result[sym] = {
-                        "c":        round(float(c), 4),
-                        "pc":       round(float(pc), 4),
-                        "h":        round(float(h), 4),
-                        "l":        round(float(l), 4),
-                        "currency": cur,
-                    }
-                    print(f"YF OK {sym}: {c} {cur}")
-                else:
-                    print(f"YF missing data for {sym}: c={c} pc={pc}")
-        except Exception as e:
-            print(f"YF batch error: {e}")
-        time.sleep(0.3)
+        today_bars = hist[hist.index.date == today_date]
+        prev_bars  = hist[hist.index.date < today_date]
 
+        if today_bars.empty:
+            # Market not open yet or weekend — use last available
+            today_bars = hist.tail(1)
+            prev_bars  = hist.iloc[:-1]
+
+        c  = round(float(today_bars["Close"].iloc[-1]), 4)
+        h  = round(float(today_bars["High"].max()), 4)
+        l  = round(float(today_bars["Low"].min()), 4)
+        pc = round(float(prev_bars["Close"].iloc[-1]), 4) if not prev_bars.empty else c
+
+        print(f"YF OK {symbol}: {c}")
+        return (symbol, {"c": c, "pc": pc, "h": h, "l": l})
+    except Exception as e:
+        print(f"YF error {symbol}: {e}")
+        return (symbol, {})
+
+def get_quotes_yf(symbols: list) -> dict:
+    """Parallel fetch via yfinance for all symbols."""
+    result = {s: {} for s in symbols}
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        for sym, data in ex.map(_fetch_yf_one, symbols):
+            result[sym] = data
     return result
 
-# Alias for backward compatibility
-def get_quotes_twelvedata(symbols: list) -> dict:
-    return get_quotes_yahoo(symbols)
+# Aliases
+def get_quotes_yahoo(symbols):      return get_quotes_yf(symbols)
+def get_quotes_twelvedata(symbols): return get_quotes_yf(symbols)
+def get_quotes_stooq(symbols):      return get_quotes_yf(symbols)
 
 # ─── FINNHUB (news + earnings + WebSocket) ────────────────────────────────────
 def get_market_news() -> list:
@@ -360,12 +361,17 @@ def start_ws():
 
 # ─── EU STOCK POLLING (Twelve Data, every 5 min) ──────────────────────────────
 def poll_eu_stocks():
+    """Real-time EU price polling using fast_info.last_price — near real-time."""
     eu = [s for s in PORTFOLIO if "." in s]
-    quotes = get_quotes_yahoo(eu)
     for symbol in eu:
-        c = quotes.get(symbol, {}).get("c", 0)
-        if c:
-            process_price(symbol, c)
+        try:
+            price = yf.Ticker(symbol).fast_info.last_price
+            if price and price > 0:
+                process_price(symbol, float(price))
+                print(f"Poll {symbol}: {price}")
+        except Exception as e:
+            print(f"Poll error {symbol}: {e}")
+        time.sleep(0.1)
 
 # ─── NEWS ALERTS ──────────────────────────────────────────────────────────────
 def is_relevant_news(headline: str, summary: str) -> bool:
