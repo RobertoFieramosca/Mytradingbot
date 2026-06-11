@@ -34,48 +34,41 @@ NEWS_IDS_FILE    = "/app/sent_news_ids.txt"
 # EU stocks: Twelve Data format with exchange
 # US stocks: plain ticker
 PORTFOLIO_DATA = {
-    "ASML":       ("ASML",              "Semiconduttori"),
-    "MSFT":       ("Microsoft",         "Tech"),
-    "GOOGL":      ("Alphabet",          "Tech"),
-    "RMS:XPAR":   ("Hermès",            "Lusso & Fashion"),
-    "AIR:XPAR":   ("Airbus",            "Industriale"),
-    "MC:XPAR":    ("LVMH",              "Lusso & Fashion"),
-    "UCG:XMIL":   ("UniCredit",         "Finance"),
-    "EL:XPAR":    ("EssilorLuxottica",  "Lusso & Fashion"),
-    "CDI:XPAR":   ("Christian Dior",    "Lusso & Fashion"),
-    "ADYEN:XAMS": ("Adyen",             "Tech"),
-    "DSY:XPAR":   ("Dassault Systèmes", "Tech"),
-    "SAP":        ("SAP",               "Tech"),
-    "ENGI:XPAR":  ("Engie",             "Energia"),
-    "DTE:XETR":   ("Deutsche Telekom",  "Telecom"),
-    "ISP:XMIL":   ("Intesa Sanpaolo",   "Finance"),
-    "SONY":       ("Sony",              "Consumer Tech"),
-    "TSM":        ("Taiwan Semi",       "Semiconduttori"),
-    "RACE":       ("Ferrari",           "Consumer"),
-    "ONON":       ("ON Holding",        "Consumer"),
-    "SU:XPAR":    ("Schneider Electric","Industriale"),
-    "SPOT":       ("Spotify",           "Tech"),
-    "IONQ":       ("IonQ",              "Quantum"),
-    "QBTS":       ("D-Wave",            "Quantum"),
-    "RGTI":       ("Rigetti",           "Quantum"),
-    "ENR:XETR":   ("Siemens Energy",    "Energia"),
-    "ASMIY":      ("ASM International", "Semiconduttori"),
-    "AMAT":       ("Applied Materials", "Semiconduttori"),
-    "AVGO":       ("Broadcom",          "Semiconduttori"),
+    "ASML":     ("ASML",              "Semiconduttori"),
+    "MSFT":     ("Microsoft",         "Tech"),
+    "GOOGL":    ("Alphabet",          "Tech"),
+    "RMS.PA":   ("Hermès",            "Lusso & Fashion"),
+    "AIR.PA":   ("Airbus",            "Industriale"),
+    "MC.PA":    ("LVMH",              "Lusso & Fashion"),
+    "UCG.MI":   ("UniCredit",         "Finance"),
+    "EL.PA":    ("EssilorLuxottica",  "Lusso & Fashion"),
+    "CDI.PA":   ("Christian Dior",    "Lusso & Fashion"),
+    "ADYEN.AS": ("Adyen",             "Tech"),
+    "DSY.PA":   ("Dassault Systèmes", "Tech"),
+    "SAP":      ("SAP",               "Tech"),
+    "ENGI.PA":  ("Engie",             "Energia"),
+    "DTE.DE":   ("Deutsche Telekom",  "Telecom"),
+    "ISP.MI":   ("Intesa Sanpaolo",   "Finance"),
+    "SONY":     ("Sony",              "Consumer Tech"),
+    "TSM":      ("Taiwan Semi",       "Semiconduttori"),
+    "RACE":     ("Ferrari",           "Consumer"),
+    "ONON":     ("ON Holding",        "Consumer"),
+    "SU.PA":    ("Schneider Electric","Industriale"),
+    "SPOT":     ("Spotify",           "Tech"),
+    "IONQ":     ("IonQ",              "Quantum"),
+    "QBTS":     ("D-Wave",            "Quantum"),
+    "RGTI":     ("Rigetti",           "Quantum"),
+    "ENR.DE":   ("Siemens Energy",    "Energia"),
+    "ASM.AS":   ("ASM International", "Semiconduttori"),
+    "AMAT":     ("Applied Materials", "Semiconduttori"),
+    "AVGO":     ("Broadcom",          "Semiconduttori"),
 }
 PORTFOLIO = {k: v[0] for k, v in PORTFOLIO_DATA.items()}
 
-# WebSocket uses plain tickers only (Finnhub US)
-WS_SYMBOLS = [s for s in PORTFOLIO if ":" not in s]
+# WebSocket uses plain tickers (Finnhub US real-time)
+WS_SYMBOLS = [s for s in PORTFOLIO if "." not in s]
 
-# Finnhub uses .XX suffix format for news/earnings
-FINNHUB_MAP = {
-    "RMS:XPAR": "RMS.PA", "AIR:XPAR": "AIR.PA", "MC:XPAR": "MC.PA",
-    "UCG:XMIL": "UCG.MI", "EL:XPAR": "EL.PA", "CDI:XPAR": "CDI.PA",
-    "ADYEN:XAMS": "ADYEN.AS", "DSY:XPAR": "DSY.PA", "ENGI:XPAR": "ENGI.PA",
-    "DTE:XETR": "DTE.DE", "ISP:XMIL": "ISP.MI", "SU:XPAR": "SU.PA",
-    "ENR:XETR": "ENR.DE",
-}
+# Yahoo Finance and Finnhub use same .XX format — no mapping needed
 
 price_history:   dict = {s: deque(maxlen=500) for s in PORTFOLIO}
 last_alert_time: dict = {}
@@ -135,93 +128,57 @@ def poll_telegram_commands():
         print(f"Command poll error: {e}")
 
 # ─── TWELVE DATA ──────────────────────────────────────────────────────────────
-# Twelve Data exchange code alternatives to try
-TD_EXCHANGE_FALLBACKS = {
-    "RMS:XPAR":   ["RMS:EPA",  "RMS:PAR"],
-    "AIR:XPAR":   ["AIR:EPA",  "AIR:PAR"],
-    "MC:XPAR":    ["MC:EPA",   "MC:PAR"],
-    "UCG:XMIL":   ["UCG:MIL",  "UCG:BIT"],
-    "EL:XPAR":    ["EL:EPA",   "EL:PAR"],
-    "CDI:XPAR":   ["CDI:EPA",  "CDI:PAR"],
-    "ADYEN:XAMS": ["ADYEN:AMS","ADYEN:XAMS"],
-    "DSY:XPAR":   ["DSY:EPA",  "DSY:PAR"],
-    "ENGI:XPAR":  ["ENGI:EPA", "ENGI:PAR"],
-    "DTE:XETR":   ["DTE:FRA",  "DTE:XETRA", "DTE:ETR"],
-    "ISP:XMIL":   ["ISP:MIL",  "ISP:BIT"],
-    "SU:XPAR":    ["SU:EPA",   "SU:PAR"],
-    "ENR:XETR":   ["ENR:FRA",  "ENR:XETRA", "ENR:ETR"],
+# ─── YAHOO FINANCE HTTP (all prices) ─────────────────────────────────────────
+YF_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept": "application/json",
 }
 
-def _td_fetch_one(symbol: str) -> dict:
-    """Fetch a single symbol from Twelve Data with fallback formats."""
-    symbols_to_try = [symbol] + TD_EXCHANGE_FALLBACKS.get(symbol, [])
-    for sym in symbols_to_try:
+def get_quotes_yahoo(symbols: list) -> dict:
+    """
+    Batch quote via Yahoo Finance v7 API.
+    Covers all markets: US, EU (Paris, Milan, Frankfurt, Amsterdam).
+    Returns prices in each stock's native currency.
+    """
+    result  = {s: {} for s in symbols}
+    CHUNK   = 20
+
+    for i in range(0, len(symbols), CHUNK):
+        chunk   = symbols[i:i+CHUNK]
+        sym_str = ",".join(chunk)
         try:
             r = requests.get(
-                f"https://api.twelvedata.com/quote?symbol={sym}&apikey={TWELVEDATA_KEY}",
-                timeout=12
+                f"https://query2.finance.yahoo.com/v7/finance/quote?symbols={sym_str}",
+                headers=YF_HEADERS, timeout=15
             ).json()
-            if r.get("status") == "error":
-                print(f"TD {sym}: {r.get('message','error')}")
-                continue
-            c  = float(r.get("close") or 0)
-            pc = float(r.get("previous_close") or 0)
-            h  = float(r.get("high") or 0)
-            l  = float(r.get("low") or 0)
-            if c > 0:
-                print(f"TD OK {sym}: close={c}")
-                return {"c": round(c,4), "pc": round(pc,4), "h": round(h,4), "l": round(l,4)}
+
+            for item in r.get("quoteResponse", {}).get("result", []):
+                sym = item.get("symbol", "")
+                c   = item.get("regularMarketPrice", 0)
+                pc  = item.get("regularMarketPreviousClose", 0)
+                h   = item.get("regularMarketDayHigh", 0)
+                l   = item.get("regularMarketDayLow", 0)
+                cur = item.get("currency", "")
+                if c and pc:
+                    result[sym] = {
+                        "c":        round(float(c), 4),
+                        "pc":       round(float(pc), 4),
+                        "h":        round(float(h), 4),
+                        "l":        round(float(l), 4),
+                        "currency": cur,
+                    }
+                    print(f"YF OK {sym}: {c} {cur}")
+                else:
+                    print(f"YF missing data for {sym}: c={c} pc={pc}")
         except Exception as e:
-            print(f"TD fetch error {sym}: {e}")
-    print(f"TD FAILED all formats for {symbol}")
-    return {}
-
-def get_quotes_twelvedata(symbols: list) -> dict:
-    """
-    Fetch quotes from Twelve Data.
-    US stocks: batch call (efficient).
-    EU stocks (with exchange code): individual calls with fallback formats.
-    """
-    result    = {s: {} for s in symbols}
-    us_syms   = [s for s in symbols if ":" not in s]
-    eu_syms   = [s for s in symbols if ":" in s]
-
-    # Batch US stocks
-    if us_syms:
-        CHUNK = 40
-        for i in range(0, len(us_syms), CHUNK):
-            chunk   = us_syms[i:i+CHUNK]
-            sym_str = ",".join(chunk)
-            try:
-                r = requests.get(
-                    f"https://api.twelvedata.com/quote?symbol={sym_str}&apikey={TWELVEDATA_KEY}",
-                    timeout=15
-                ).json()
-                if "symbol" in r:  # single symbol response
-                    r = {r["symbol"]: r}
-                for sym, data in r.items():
-                    if isinstance(data, dict) and data.get("status") != "error":
-                        c  = float(data.get("close") or 0)
-                        pc = float(data.get("previous_close") or 0)
-                        if c > 0:
-                            result[sym] = {
-                                "c":  round(c, 4),
-                                "pc": round(pc, 4),
-                                "h":  round(float(data.get("high") or 0), 4),
-                                "l":  round(float(data.get("low") or 0), 4),
-                            }
-                    else:
-                        print(f"TD US error {sym}: {data}")
-            except Exception as e:
-                print(f"TD US batch error: {e}")
-            time.sleep(0.3)
-
-    # EU stocks: individual calls with fallbacks
-    for sym in eu_syms:
-        result[sym] = _td_fetch_one(sym)
-        time.sleep(0.2)
+            print(f"YF batch error: {e}")
+        time.sleep(0.3)
 
     return result
+
+# Alias for backward compatibility
+def get_quotes_twelvedata(symbols: list) -> dict:
+    return get_quotes_yahoo(symbols)
 
 # ─── FINNHUB (news + earnings + WebSocket) ────────────────────────────────────
 def get_market_news() -> list:
@@ -235,13 +192,13 @@ def get_market_news() -> list:
         return []
 
 def get_company_news(symbol: str) -> list:
-    fh_sym = FINNHUB_MAP.get(symbol, symbol)
+    # Yahoo Finance uses same .XX format as Finnhub — no mapping needed
     today     = date.today().isoformat()
     yesterday = (date.today() - timedelta(days=1)).isoformat()
     try:
         r = requests.get(
             f"https://finnhub.io/api/v1/company-news"
-            f"?symbol={fh_sym}&from={yesterday}&to={today}&token={FINNHUB_KEY}",
+            f"?symbol={symbol}&from={yesterday}&to={today}&token={FINNHUB_KEY}",
             timeout=10
         )
         return r.json()[:5]
@@ -403,8 +360,8 @@ def start_ws():
 
 # ─── EU STOCK POLLING (Twelve Data, every 5 min) ──────────────────────────────
 def poll_eu_stocks():
-    eu = [s for s in PORTFOLIO if ":" in s]
-    quotes = get_quotes_twelvedata(eu)
+    eu = [s for s in PORTFOLIO if "." in s]
+    quotes = get_quotes_yahoo(eu)
     for symbol in eu:
         c = quotes.get(symbol, {}).get("c", 0)
         if c:
@@ -547,7 +504,7 @@ def eu_close_summary():
         portfolio_str, big_movers_str, extremes_str = build_portfolio_context(quotes)
 
         earnings       = get_earnings_calendar()
-        my_tickers_fh  = set(FINNHUB_MAP.values()) | set(WS_SYMBOLS)
+        my_tickers_fh  = set(PORTFOLIO.keys())
         my_earn        = [e for e in earnings if e.get("symbol") in my_tickers_fh]
         other_earn     = [e for e in earnings[:10] if e.get("symbol") not in my_tickers_fh]
         my_earn_str    = "\n".join(f"⚠️ {e['symbol']} — EPS est: {e.get('epsEstimate','N/A')}" for e in my_earn) or "Nessuno"
