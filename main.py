@@ -135,34 +135,32 @@ from datetime import timezone
 
 def _fetch_yf_one(symbol: str) -> tuple:
     """
-    Fetch one symbol using yfinance history() — always returns native currency.
-    RMS.PA → EUR, MSFT → USD, DTE.DE → EUR etc.
+    Fetch one symbol using yfinance.
+    - Intraday OHLC: period=1d interval=1m (only today, no timezone confusion)
+    - Prev close: period=5d interval=1d (take second-to-last daily bar)
+    Always returns native currency (EUR for EU, USD for US).
     """
     try:
         ticker = yf.Ticker(symbol)
-        # 2 days of 1-min bars: gives today's intraday OHLC + yesterday's close
-        hist = ticker.history(period="2d", interval="1m", auto_adjust=False)
-        if hist.empty:
-            print(f"YF empty for {symbol}")
+
+        # Today's intraday bars only
+        intraday = ticker.history(period="1d", interval="1m", auto_adjust=False)
+        if intraday.empty:
+            print(f"YF empty intraday for {symbol}")
             return (symbol, {})
 
-        hist.index = hist.index.tz_localize(None) if hist.index.tzinfo is None else hist.index.tz_convert(None)
-        today_date = datetime.utcnow().date()
+        c = round(float(intraday["Close"].iloc[-1]), 4)
+        h = round(float(intraday["High"].max()), 4)
+        l = round(float(intraday["Low"].min()), 4)
 
-        today_bars = hist[hist.index.date == today_date]
-        prev_bars  = hist[hist.index.date < today_date]
+        # Previous close from daily bars
+        daily = ticker.history(period="5d", interval="1d", auto_adjust=False)
+        if len(daily) >= 2:
+            pc = round(float(daily["Close"].iloc[-2]), 4)
+        else:
+            pc = c
 
-        if today_bars.empty:
-            # Market not open yet or weekend — use last available
-            today_bars = hist.tail(1)
-            prev_bars  = hist.iloc[:-1]
-
-        c  = round(float(today_bars["Close"].iloc[-1]), 4)
-        h  = round(float(today_bars["High"].max()), 4)
-        l  = round(float(today_bars["Low"].min()), 4)
-        pc = round(float(prev_bars["Close"].iloc[-1]), 4) if not prev_bars.empty else c
-
-        print(f"YF OK {symbol}: {c}")
+        print(f"YF OK {symbol}: c={c} h={h} l={l} pc={pc}")
         return (symbol, {"c": c, "pc": pc, "h": h, "l": l})
     except Exception as e:
         print(f"YF error {symbol}: {e}")
@@ -254,11 +252,7 @@ def build_portfolio_context(quotes: dict):
                 tag = "SU" if pct > 0 else "GIU"
                 big_movers.append(f"<b>{name}</b> {sign}{pct:.1f}% ({tag})")
 
-            # Near daily high/low (within 0.3%)
-            if h and c and abs(c - h) / h < 0.003:
-                new_extremes.append(f"{name} vicino al massimo: {c:.2f} / max {h:.2f}")
-            elif l and c and l > 0 and abs(c - l) / l < 0.003:
-                new_extremes.append(f"{name} vicino al minimo: {c:.2f} / min {l:.2f}")
+            # max/min removed — too unreliable
         else:
             sector_data[sector].append((name, None, f"{name}: N/A"))
 
@@ -289,7 +283,7 @@ def build_portfolio_context(quotes: dict):
     big_movers_str = "\n".join(big_movers) or "Nessun movimento > 2.5%"
     extremes_str   = "\n".join(new_extremes) or "—"
 
-    return portfolio_str, big_movers_str, extremes_str
+    return portfolio_str, big_movers_str
 
 # ─── VELOCITY PRICE ALERTS ────────────────────────────────────────────────────
 def process_price(symbol: str, price: float):
@@ -507,7 +501,7 @@ def eu_close_summary():
     try:
         # All stocks, EU focus
         quotes = get_quotes_twelvedata(list(PORTFOLIO_DATA.keys()))
-        portfolio_str, big_movers_str, extremes_str = build_portfolio_context(quotes)
+        portfolio_str, big_movers_str = build_portfolio_context(quotes)
 
         earnings       = get_earnings_calendar()
         my_tickers_fh  = set(PORTFOLIO.keys())
@@ -517,16 +511,13 @@ def eu_close_summary():
         other_earn_str = "\n".join(f"• {e['symbol']}" for e in other_earn[:5]) or "—"
         news_str       = "\n".join(f"- {n['headline']}" for n in get_market_news()[:5])
 
-        prompt = f"""Sono le 17:30, mercati EU appena chiusi. Summary per Roberto — focus EU.
+        prompt = f"""Sei l'assistente trading di Roberto. Sono le 17:30, mercati EU appena chiusi.
 
 PORTAFOGLIO PER SETTORE:
 {portfolio_str}
 
 MOVERS >±2.5%:
 {big_movers_str}
-
-VICINO A MASSIMI/MINIMI DI GIORNATA:
-{extremes_str}
 
 NEWS:
 {news_str}
@@ -537,20 +528,20 @@ EARNINGS DOMANI — ALTRI: {other_earn_str}
 Max 420 parole. Professionale, da analista senior. <b>Grassetto</b> per titoli >2.5% e nomi sezione.
 STRUTTURA FISSA:
 
-<b>Chiusura EU</b> — CAC40, DAX, FTSE MIB — sentiment e dati principali
+<b>Chiusura EU</b> — CAC40, DAX, FTSE MIB: sentiment e dati
 
-<b>Trend Settoriali</b> — focus sui tuoi settori EU, in ordine:
-Lusso & Fashion | Tech EU | Semiconduttori | Finance | Energia | Industriale | Quantum
+<b>Trend Settoriali</b> — in ordine, con trend e media %:
+Lusso e Fashion | Tech | Semiconduttori | Quantum | Finance | Energia | Industriale | Telecom
 
-<b>Movers del Giorno</b> — titoli >2.5% in grassetto con causa in una riga
+<b>Movers del Giorno</b> — titoli >2.5% in grassetto con causa
 
-<b>Massimi/Minimi</b> — titoli vicini al max/min di giornata
+<b>Earnings Domani</b> — tuoi titoli (valutare uscita?), poi altri importanti
 
-<b>Earnings Domani</b> — tuoi titoli con call (valutare uscita?), poi altri rilevanti
+<b>News Rilevanti</b> — 2-3 notizie che hanno mosso i mercati oggi
 
-<b>Stock Idea</b> — 1 titolo fuori portafoglio interessante
+<b>Stock da Guardare</b> — 1 titolo fuori portafoglio con motivazione
 
-<b>Domani</b> — 1 cosa da monitorare all'apertura
+<b>Domani</b> — 1 cosa concreta da monitorare
 
 In italiano. Solo fatti e numeri."""
 
@@ -566,10 +557,10 @@ def us_close_summary():
     try:
         # All stocks, US focus
         quotes = get_quotes_twelvedata(list(PORTFOLIO_DATA.keys()))
-        portfolio_str, big_movers_str, extremes_str = build_portfolio_context(quotes)
+        portfolio_str, big_movers_str = build_portfolio_context(quotes)
         news_str = "\n".join(f"- {n['headline']}" for n in get_market_news()[:5])
 
-        prompt = f"""Sono le 22:00, Wall Street ha chiuso. Summary per Roberto — focus US e tech.
+        prompt = f"""Sei l'assistente trading di Roberto. Sono le 22:00, Wall Street ha chiuso.
 
 PORTAFOGLIO PER SETTORE:
 {portfolio_str}
@@ -577,27 +568,26 @@ PORTAFOGLIO PER SETTORE:
 MOVERS >±2.5%:
 {big_movers_str}
 
-VICINO A MASSIMI/MINIMI:
-{extremes_str}
-
 NEWS:
 {news_str}
 
 Max 380 parole. Professionale. <b>Grassetto</b> per titoli >2.5% e nomi sezione.
 STRUTTURA FISSA:
 
-<b>Chiusura US</b> — S&P500, Nasdaq, Dow — sentiment e dati principali
+<b>Chiusura US</b> — S&P500, Nasdaq, Dow: sentiment e dati
 
-<b>Trend Settoriali</b> — focus sui tuoi settori US, in ordine:
-Tech | Semiconduttori | Quantum | Consumer Tech | Consumer | Finance US
+<b>Trend Settoriali</b> — focus US, in ordine:
+Tech | Semiconduttori | Quantum | Consumer Tech | Consumer | Finance
 
 <b>Movers del Giorno</b> — titoli >2.5% in grassetto con causa
 
-<b>Massimi/Minimi</b> — titoli vicini al max/min di giornata
+<b>News Rilevanti</b> — 2-3 notizie che hanno mosso Wall Street oggi
 
-<b>Takeaway</b> — 1-2 osservazioni chiave sulla sessione americana
+<b>Stock da Guardare</b> — 1 titolo fuori portafoglio con motivazione
 
-<b>Domani EU</b> — cosa aspettarsi all'apertura europea domani
+<b>Takeaway</b> — 1-2 osservazioni chiave sulla sessione
+
+<b>Domani EU</b> — cosa aspettarsi all'apertura europea
 
 In italiano. Solo fatti e numeri."""
 
