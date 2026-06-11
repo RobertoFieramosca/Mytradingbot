@@ -336,14 +336,16 @@ PORTAFOGLIO (var. da chiusura precedente):
 NEWS RECENTI:
 {news_str}
 
-Messaggio Telegram max 300 parole:
-🌏 ASIA OVERNIGHT — cosa è successo stanotte
-🇪🇺 APERTURA EU — cosa aspettarsi
-📊 PORTAFOGLIO — solo movimenti o news rilevanti
-🔥 TEMA DEL GIORNO — 1 tema caldo
-⚠️ RISCHIO — 1 cosa da monitorare
+Messaggio Telegram max 300 parole. Tono professionale, asciutto, come un buon analista.
+Niente emoji eccessive — al massimo una per sezione titolo. Niente esclamazioni.
 
-Diretto, professionale, in italiano."""
+ASIA OVERNIGHT — cosa è successo stanotte
+APERTURA EU — cosa aspettarsi oggi
+PORTAFOGLIO — solo movimenti o news rilevanti, con i numeri
+TEMA DEL GIORNO — 1 tema o titolo caldo
+RISCHIO — 1 cosa concreta da monitorare
+
+In italiano. Nessun fronzolo."""
 
     send_telegram(f"🌅 <b>BRIEFING MATTUTINO</b>\n\n{claude_analyze(prompt)}")
     print("Morning briefing sent.")
@@ -368,12 +370,13 @@ def ny_summary():
 PORTAFOGLIO:
 {portfolio_str}
 
-Messaggio Telegram max 200 parole:
-🗽 NY APERTURA — direzione del mercato americano
-📊 PORTAFOGLIO — movimenti rilevanti finora
-👀 DA MONITORARE — cosa può muoversi nel pomeriggio NY
+Messaggio Telegram max 200 parole. Tono professionale e asciutto, niente emoji eccessive.
 
-In italiano, diretto, concreto."""
+NY APERTURA — direzione del mercato americano con i dati
+PORTAFOGLIO — movimenti rilevanti finora con percentuali
+DA MONITORARE — cosa può muoversi nel pomeriggio NY
+
+In italiano. Solo i fatti."""
 
     send_telegram(f"🗽 <b>NY SUMMARY</b>\n\n{claude_analyze(prompt)}")
     print("NY summary sent.")
@@ -452,17 +455,18 @@ EARNINGS CALL DOMANI — TUOI TITOLI:
 EARNINGS CALL DOMANI — ALTRI TITOLI DI RILIEVO:
 {earnings_other_str}
 
-Scrivi UN messaggio Telegram (max 400 parole) con queste sezioni:
+Scrivi UN messaggio Telegram (max 400 parole). Tono professionale, da analista senior.
+Niente emoji eccessive. Usa il grassetto HTML <b>...</b> per i numeri importanti e i titoli che si muovono oltre 2.5%.
 
-🇪🇺 CHIUSURA EU — sentiment generale dei mercati europei oggi
-🔺🔻 MOVERS DEL GIORNO — titoli con movimento >2.5%, in grassetto, con breve spiegazione
-📰 NEWS CHIAVE — 2-3 notizie che hanno mosso i mercati oggi
-⚠️ EARNINGS DOMANI — avvisa Roberto se ha titoli con earnings call domani (suggerisci se valutare uscita), poi altri titoli importanti
-💡 STOCK DA GUARDARE — 1-2 titoli interessanti fuori portafoglio da tenere d'occhio
-🎯 TAKEAWAY — 1-2 osservazioni chiave sulla giornata
-👀 DOMANI — 1 cosa da monitorare all'apertura
+CHIUSURA EU — sentiment generale con i dati principali degli indici
+MOVERS DEL GIORNO — titoli con movimento >2.5% in grassetto, con breve spiegazione della causa
+NEWS CHIAVE — 2-3 notizie rilevanti di giornata
+EARNINGS DOMANI — se Roberto ha titoli con earnings call domani, segnalarlo chiaramente con suggerimento; poi altri titoli importanti
+STOCK DA GUARDARE — 1-2 titoli interessanti fuori portafoglio
+TAKEAWAY — 1-2 osservazioni chiave, dirette
+DOMANI — 1 cosa concreta da monitorare
 
-In italiano, diretto, concreto. I movimenti >2.5% in grassetto."""
+In italiano. Nessun fronzolo, nessuna esclamazione."""
 
     send_telegram(f"🇪🇺 <b>CHIUSURA EU</b>\n\n{claude_analyze(prompt)}")
 
@@ -486,6 +490,8 @@ if __name__ == "__main__":
     print("Starting TradingAlertRF bot...")
 
     start_websocket_thread()
+
+    eu_close_summary()  # TEMP: run once on startup, remove tomorrow
 
     schedule.every().day.at("07:00").do(morning_briefing)
     schedule.every().day.at("16:00").do(ny_summary)
