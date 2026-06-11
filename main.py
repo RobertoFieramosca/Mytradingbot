@@ -1,13 +1,20 @@
 #!/usr/bin/env python3
 """
 TradingAlertRF — Roberto's personal trading assistant
-Real-time price alerts via WebSocket + scheduled briefings via Telegram.
 
-Alert system (drops only, measured from rolling price history):
-  🚨 EMERGENCY   — drop >= 2% in <= 5 min
-  🔴 ROSSA       — drop >= 2% in <= 10 min
-  🟡 GIALLA      — drop >= 2% in <= 30 min
-  Quantum stocks (IONQ, RGTI, QBTS): EMERGENCY only
+Schedule:
+  07:00 — Morning briefing (Asia overnight, EU open, portfolio, theme of the day)
+  16:00 — NY Summary (30 min after Wall Street open)
+  17:30 — EU Close Summary (detailed end-of-day report)
+
+Real-time alerts:
+  🚨 EMERGENCY   — drop >= 2% in <= 5 min  (all stocks)
+  🔴 ROSSA       — drop >= 2% in <= 10 min (non-quantum)
+  🟡 GIALLA      — drop >= 2% in <= 30 min (non-quantum)
+  📈 RIALZO      — rise >= 3% in 30 min    (all stocks)
+  Quantum (IONQ, RGTI, QBTS): EMERGENCY only
+
+  📰 Relevant company news: continuous
 """
 
 import os
@@ -29,10 +36,9 @@ FINNHUB_KEY     = os.environ.get("FINNHUB_KEY")
 CLAUDE_KEY      = os.environ.get("CLAUDE_KEY")
 
 STOCKHOLM_TZ    = pytz.timezone("Europe/Stockholm")
-DROP_THRESHOLD  = 2.0   # % drop to trigger any alert
-RISE_THRESHOLD  = 3.0   # % rise to trigger opportunity alert
+DROP_THRESHOLD  = 2.0   # % drop to trigger velocity alert
+DAY_THRESHOLD   = 2.5   # % daily move to highlight in summary
 
-# Quantum stocks — EMERGENCY only, skip ROSSA and GIALLA
 QUANTUM_STOCKS  = {"IONQ", "QBTS", "RGTI"}
 
 # Roberto's portfolio — Finnhub symbol: display name
@@ -67,12 +73,10 @@ PORTFOLIO = {
     "AVGO":     "Broadcom",
 }
 
-# Rolling price history: {symbol: deque of (unix_timestamp, price)}
-price_history: dict = {s: deque(maxlen=500) for s in PORTFOLIO}
-
-# Cooldown: track last alert time per symbol (30 min cooldown)
+# Rolling price history for velocity alerts
+price_history: dict  = {s: deque(maxlen=500) for s in PORTFOLIO}
 last_alert_time: dict = {}
-ALERT_COOLDOWN  = 30 * 60  # seconds
+ALERT_COOLDOWN        = 30 * 60  # 30 min between alerts per symbol
 
 sent_news_ids: set = set()
 
@@ -115,45 +119,63 @@ def get_company_news(symbol: str) -> list:
     except:
         return []
 
+def get_earnings_calendar() -> list:
+    tomorrow = (date.today() + timedelta(days=1)).isoformat()
+    url = (
+        f"https://finnhub.io/api/v1/calendar/earnings"
+        f"?from={tomorrow}&to={tomorrow}&token={FINNHUB_KEY}"
+    )
+    try:
+        data = requests.get(url, timeout=10).json()
+        return data.get("earningsCalendar", [])
+    except:
+        return []
+
+def get_52w_data(symbol: str) -> dict:
+    """Get 52-week high/low via quote endpoint (h = high of day, l = low)."""
+    url = f"https://finnhub.io/api/v1/quote?symbol={symbol}&token={FINNHUB_KEY}"
+    try:
+        return requests.get(url, timeout=10).json()
+    except:
+        return {}
+
 # ─── CLAUDE ───────────────────────────────────────────────────────────────────
 def claude_analyze(prompt: str) -> str:
     client = anthropic.Anthropic(api_key=CLAUDE_KEY)
     try:
         msg = client.messages.create(
             model="claude-sonnet-4-20250514",
-            max_tokens=800,
+            max_tokens=1000,
             messages=[{"role": "user", "content": prompt}]
         )
         return msg.content[0].text
     except Exception as e:
         return f"Errore analisi: {e}"
 
-# ─── PRICE ALERT LOGIC ────────────────────────────────────────────────────────
+# ─── VELOCITY PRICE ALERTS ────────────────────────────────────────────────────
 def process_price(symbol: str, current_price: float):
-    """Add price to history and check all alert levels."""
     if symbol not in PORTFOLIO:
         return
 
     now = time.time()
     price_history[symbol].append((now, current_price))
 
-    # Cooldown check — don't spam alerts on same symbol
-    last = last_alert_time.get(symbol, 0)
-    if now - last < ALERT_COOLDOWN:
+    # Cooldown check
+    if now - last_alert_time.get(symbol, 0) < ALERT_COOLDOWN:
         return
 
     name       = PORTFOLIO[symbol]
     is_quantum = symbol in QUANTUM_STOCKS
     history    = price_history[symbol]
 
-    # Alert levels: (window_seconds, label, emoji, active_for_quantum)
+    # (window_secs, drop_label, drop_emoji, rise_label, rise_emoji, active_for_quantum)
     levels = [
-        (5  * 60, "EMERGENCY",    "🚨", True),
-        (10 * 60, "ALLERTA ROSSA","🔴", not is_quantum),
-        (30 * 60, "ALLERTA GIALLA","🟡", not is_quantum),
+        (5  * 60, "EMERGENCY",     "🚨", "ROCKET",      "🚀", True),
+        (10 * 60, "ALLERTA ROSSA", "🔴", "VERDE FORTE", "💚", not is_quantum),
+        (30 * 60, "ALLERTA GIALLA","🟡", "VERDE",        "🟢", not is_quantum),
     ]
 
-    for window_secs, label, emoji, active in levels:
+    for window_secs, drop_label, drop_emoji, rise_label, rise_emoji, active in levels:
         if not active:
             continue
 
@@ -163,33 +185,31 @@ def process_price(symbol: str, current_price: float):
         if len(window_prices) < 2:
             continue
 
-        ref_price = window_prices[0][1]   # oldest price in the window
+        ref_price = window_prices[0][1]
         pct       = (current_price - ref_price) / ref_price * 100
-        minutes   = int((now - window_prices[0][0]) / 60)
+        minutes   = max(1, int((now - window_prices[0][0]) / 60))
 
-        # DROP alert
         if pct <= -DROP_THRESHOLD:
             send_telegram(
-                f"{emoji} <b>{label} — {name}</b>\n\n"
+                f"{drop_emoji} <b>{drop_label} — {name}</b>\n\n"
                 f"📉 {pct:+.1f}% in {minutes} minuti\n"
                 f"Da {ref_price:.2f} → {current_price:.2f}"
             )
             last_alert_time[symbol] = now
-            print(f"{label}: {name} {pct:+.1f}% in {minutes}min")
-            return  # Fire only the most severe level
+            print(f"{drop_label}: {name} {pct:+.1f}% in {minutes}min")
+            return
 
-        # RISE alert (single level, all stocks)
-        if pct >= RISE_THRESHOLD and window_secs == 30 * 60:
+        if pct >= DROP_THRESHOLD:
             send_telegram(
-                f"📈 <b>RIALZO — {name}</b>\n\n"
-                f"+{pct:.1f}% in {minutes} minuti\n"
+                f"{rise_emoji} <b>{rise_label} — {name}</b>\n\n"
+                f"📈 +{pct:.1f}% in {minutes} minuti\n"
                 f"Da {ref_price:.2f} → {current_price:.2f}"
             )
             last_alert_time[symbol] = now
-            print(f"Rise alert: {name} +{pct:.1f}% in {minutes}min")
+            print(f"{rise_label}: {name} +{pct:.1f}% in {minutes}min")
             return
 
-# ─── WEBSOCKET (US stocks real-time) ──────────────────────────────────────────
+# ─── WEBSOCKET (US stocks) ────────────────────────────────────────────────────
 def on_ws_message(ws, message):
     try:
         data = json.loads(message)
@@ -225,46 +245,73 @@ def start_websocket_thread():
 
 # ─── EU STOCKS POLLING (every 5 min) ──────────────────────────────────────────
 def poll_eu_stocks():
-    eu_symbols = [s for s in PORTFOLIO if "." in s]
-    for symbol in eu_symbols:
-        q = get_quote(symbol)
-        c = q.get("c", 0)
-        if c:
-            process_price(symbol, c)
+    for symbol in PORTFOLIO:
+        if "." in symbol:
+            q = get_quote(symbol)
+            c = q.get("c", 0)
+            if c:
+                process_price(symbol, c)
 
-# ─── NEWS ALERTS (relevant only) ──────────────────────────────────────────────
-RELEVANT_KEYWORDS = [
-    "earnings", "revenue", "profit", "loss", "guidance", "outlook",
-    "acquisition", "merger", "takeover", "buyout",
-    "upgrade", "downgrade", "target price", "price target",
-    "fda", "regulatory", "lawsuit", "investigation",
-    "ceo", "cfo", "resign", "appoint",
-    "dividend", "buyback", "recall", "fine", "penalty",
-]
+# ─── NEWS ALERTS ──────────────────────────────────────────────────────────────
+def is_breaking_news(headline: str, summary: str) -> bool:
+    """Use Claude to determine if a news item is truly breaking and market-moving.
+    Returns True only for high-impact news (score >= 8/10)."""
+    client = anthropic.Anthropic(api_key=CLAUDE_KEY)
+    try:
+        msg = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=10,
+            messages=[{
+                "role": "user",
+                "content": (
+                    "You are a financial news filter for an active investor. "
+                    "Rate this news item 1-10 for relevance to an investor holding this stock.\n\n"
+                    "Score 8-10: CEO/CFO change, acquisition announced, bankruptcy, fraud, "
+                    "regulatory ban, sanctions, major lawsuit outcome.\n"
+                    "Score 6-7: earnings results (beat or miss), analyst upgrade or downgrade, "
+                    "analyst reiterates rating, guidance revision, dividend change, "
+                    "share buyback announced, major contract won or lost.\n"
+                    "Score 1-5: generic sector overview, market commentary, background article, "
+                    "minor product update, conference attendance, awards.\n\n"
+                    f"Headline: {headline}\n"
+                    f"Summary: {summary[:300]}\n\n"
+                    "Reply with ONLY a single integer 1-10. Nothing else."
+                )
+            }]
+        )
+        score = int(msg.content[0].text.strip())
+        print(f"News score {score}/10: {headline[:60]}")
+        return score >= 6
+    except Exception as e:
+        print(f"News filter error: {e}")
+        return False
 
 def check_news_alerts():
     for symbol, name in PORTFOLIO.items():
         for news in get_company_news(symbol):
             nid      = str(news.get("id") or news.get("datetime") or "")
             headline = news.get("headline", "")
-            summary  = (news.get("summary") or "")
+            summary  = news.get("summary") or ""
             url      = news.get("url", "")
 
             if not nid or nid in sent_news_ids:
                 continue
 
-            text = (headline + " " + summary).lower()
-            if any(kw in text for kw in RELEVANT_KEYWORDS):
-                sent_news_ids.add(nid)
+            # Mark as seen immediately to avoid re-processing
+            sent_news_ids.add(nid)
+
+            # Claude filters: only truly breaking news passes
+            if is_breaking_news(headline, summary):
                 send_telegram(
-                    f"📰 <b>NEWS — {name}</b>\n\n"
+                    f"🚨 <b>BREAKING NEWS — {name}</b>\n\n"
                     f"{headline}\n\n"
                     f"🔗 {url}"
                 )
-                print(f"News: {name} — {headline}")
-                time.sleep(1)
+                print(f"Breaking news sent: {name} — {headline}")
 
-# ─── MORNING BRIEFING (07:00 Stockholm) ───────────────────────────────────────
+            time.sleep(0.5)  # avoid hammering the API
+
+# ─── MORNING BRIEFING 07:00 ───────────────────────────────────────────────────
 def morning_briefing():
     print("Generating morning briefing...")
 
@@ -276,12 +323,12 @@ def morning_briefing():
             pct = (c - pc) / pc * 100
             lines.append(f"{name}: {c:.2f} ({pct:+.1f}%)")
 
-    portfolio_str = "\n".join(lines) or "Dati non disponibili"
+    portfolio_str = "\n".join(lines) or "N/A"
     news_str      = "\n".join(f"- {n['headline']}" for n in get_market_news()[:6])
     today_str     = datetime.now(STOCKHOLM_TZ).strftime("%A %d %B %Y")
 
-    prompt = f"""Sei l'assistente trading personale di Roberto, investitore attivo su mercati europei e globali.
-Oggi è {today_str}. Genera un briefing mattutino conciso prima dell'apertura EU.
+    prompt = f"""Sei l'assistente trading personale di Roberto, investitore attivo.
+Oggi è {today_str}. Briefing mattutino prima dell'apertura EU.
 
 PORTAFOGLIO (var. da chiusura precedente):
 {portfolio_str}
@@ -301,7 +348,7 @@ Diretto, professionale, in italiano."""
     send_telegram(f"🌅 <b>BRIEFING MATTUTINO</b>\n\n{claude_analyze(prompt)}")
     print("Morning briefing sent.")
 
-# ─── NY SUMMARY (16:00 Stockholm = 10:00 ET) ──────────────────────────────────
+# ─── NY SUMMARY 16:00 ─────────────────────────────────────────────────────────
 def ny_summary():
     print("Generating NY summary...")
 
@@ -314,7 +361,7 @@ def ny_summary():
             icon = "📈" if pct > 0 else "📉" if pct < 0 else "➡️"
             lines.append(f"{icon} {name}: {c:.2f} ({pct:+.1f}%)")
 
-    portfolio_str = "\n".join(lines) or "Dati non disponibili"
+    portfolio_str = "\n".join(lines) or "N/A"
 
     prompt = f"""Sono le 16:00 CET, NY ha aperto da 30 minuti. Summary rapido per Roberto.
 
@@ -330,6 +377,100 @@ In italiano, diretto, concreto."""
 
     send_telegram(f"🗽 <b>NY SUMMARY</b>\n\n{claude_analyze(prompt)}")
     print("NY summary sent.")
+
+# ─── EU CLOSE SUMMARY 17:30 ───────────────────────────────────────────────────
+def eu_close_summary():
+    print("Generating EU close summary...")
+
+    # Collect portfolio data
+    portfolio_data = []
+    big_movers     = []   # > DAY_THRESHOLD %
+    new_extremes   = []   # 52w high/low
+
+    for symbol, name in PORTFOLIO.items():
+        q   = get_quote(symbol)
+        c   = q.get("c", 0)
+        pc  = q.get("pc", 0)
+        h   = q.get("h", 0)   # today's high
+        l   = q.get("l", 0)   # today's low
+        h52 = q.get("t", 0)   # Finnhub doesn't give 52w directly; use as timestamp placeholder
+
+        if not c or not pc:
+            continue
+
+        pct  = (c - pc) / pc * 100
+        icon = "📈" if pct > 0 else "📉" if pct < 0 else "➡️"
+        portfolio_data.append(f"{icon} {name}: {c:.2f} ({pct:+.1f}%)")
+
+        # Flag big daily movers
+        if abs(pct) >= DAY_THRESHOLD:
+            flag = "🔺" if pct > 0 else "🔻"
+            big_movers.append(f"{flag} <b>{name}</b> {pct:+.1f}%")
+
+    # Earnings tomorrow
+    earnings = get_earnings_calendar()
+    portfolio_tickers = set(PORTFOLIO.keys())
+    relevant_earnings = [
+        e for e in earnings
+        if e.get("symbol") in portfolio_tickers
+    ]
+    other_earnings = [
+        e for e in earnings[:10]
+        if e.get("symbol") not in portfolio_tickers
+    ]
+
+    earnings_portfolio_str = "\n".join(
+        f"⚠️ {e['symbol']} — EPS est: {e.get('epsEstimate', 'N/A')}"
+        for e in relevant_earnings
+    ) or "Nessuno dei tuoi titoli"
+
+    earnings_other_str = "\n".join(
+        f"• {e['symbol']}"
+        for e in other_earnings[:5]
+    ) or "N/A"
+
+    # Market news
+    news_str = "\n".join(f"- {n['headline']}" for n in get_market_news()[:6])
+
+    portfolio_str  = "\n".join(portfolio_data) or "N/A"
+    big_movers_str = "\n".join(big_movers) or "Nessun movimento superiore al 2.5%"
+
+    prompt = f"""Sei l'assistente trading di Roberto. Sono le 17:30, i mercati europei hanno chiuso.
+
+PERFORMANCE PORTAFOGLIO OGGI:
+{portfolio_str}
+
+MOVIMENTI SIGNIFICATIVI (>±2.5%):
+{big_movers_str}
+
+NEWS DEL GIORNO:
+{news_str}
+
+EARNINGS CALL DOMANI — TUOI TITOLI:
+{earnings_portfolio_str}
+
+EARNINGS CALL DOMANI — ALTRI TITOLI DI RILIEVO:
+{earnings_other_str}
+
+Scrivi UN messaggio Telegram (max 400 parole) con queste sezioni:
+
+🇪🇺 CHIUSURA EU — sentiment generale dei mercati europei oggi
+🔺🔻 MOVERS DEL GIORNO — titoli con movimento >2.5%, in grassetto, con breve spiegazione
+📰 NEWS CHIAVE — 2-3 notizie che hanno mosso i mercati oggi
+⚠️ EARNINGS DOMANI — avvisa Roberto se ha titoli con earnings call domani (suggerisci se valutare uscita), poi altri titoli importanti
+💡 STOCK DA GUARDARE — 1-2 titoli interessanti fuori portafoglio da tenere d'occhio
+🎯 TAKEAWAY — 1-2 osservazioni chiave sulla giornata
+👀 DOMANI — 1 cosa da monitorare all'apertura
+
+In italiano, diretto, concreto. I movimenti >2.5% in grassetto."""
+
+    send_telegram(f"🇪🇺 <b>CHIUSURA EU</b>\n\n{claude_analyze(prompt)}")
+
+    # Separate message for 52w extremes if any
+    if new_extremes:
+        send_telegram("🏆 <b>NUOVI ESTREMI</b>\n\n" + "\n".join(new_extremes))
+
+    print("EU close summary sent.")
 
 # ─── DAILY RESET ──────────────────────────────────────────────────────────────
 def daily_reset():
@@ -348,14 +489,16 @@ if __name__ == "__main__":
 
     schedule.every().day.at("07:00").do(morning_briefing)
     schedule.every().day.at("16:00").do(ny_summary)
+    schedule.every().day.at("17:30").do(eu_close_summary)
     schedule.every(5).minutes.do(poll_eu_stocks)
-    schedule.every(5).minutes.do(check_news_alerts)
+    schedule.every(1).hours.do(check_news_alerts)
     schedule.every().day.at("00:01").do(daily_reset)
 
     send_telegram(
         "🤖 <b>TradingAlertRF attivo!</b>\n\n"
-        "🌅 Briefing: 07:00\n"
+        "🌅 Briefing mattutino: 07:00\n"
         "🗽 NY Summary: 16:00\n"
+        "🇪🇺 Chiusura EU: 17:30\n"
         "🚨 Emergency: ≥2% in ≤5 min\n"
         "🔴 Rossa: ≥2% in ≤10 min\n"
         "🟡 Gialla: ≥2% in ≤30 min\n"
