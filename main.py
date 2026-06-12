@@ -29,12 +29,19 @@ STOCKHOLM_TZ     = pytz.timezone("Europe/Stockholm")
 DROP_THRESHOLD   = 2.0
 DAY_THRESHOLD    = 2.5
 QUANTUM_STOCKS   = {"IONQ", "QBTS", "RGTI"}
+
+# Custom alert thresholds for high-conviction / large positions.
+# Tighter % = more sensitive. These symbols also get polled every 2 min instead of 5.
+CUSTOM_THRESHOLDS = {
+    "ASML.AS": 1.0,   # large position, tactical swing trading
+}
+FAST_POLL_SYMBOLS = set(CUSTOM_THRESHOLDS.keys())
 NEWS_IDS_FILE    = "/app/sent_news_ids.txt"
 
 # EU stocks: Twelve Data format with exchange
 # US stocks: plain ticker
 PORTFOLIO_DATA = {
-    "ASML":     ("ASML",              "Semiconduttori"),
+    "ASML.AS":  ("ASML",              "Semiconduttori"),
     "MSFT":     ("Microsoft",         "Tech"),
     "GOOGL":    ("Alphabet",          "Tech"),
     "RMS.PA":   ("Hermès",            "Lusso & Fashion"),
@@ -72,8 +79,29 @@ WS_SYMBOLS = [s for s in PORTFOLIO if "." not in s]
 
 price_history:   dict = {s: deque(maxlen=500) for s in PORTFOLIO}
 last_alert_time: dict = {}
+warmed_up:       set  = set()   # symbols that have had their first (possibly stale) price discarded
 ALERT_COOLDOWN        = 30 * 60
 last_update_id:  int  = 0
+
+# ─── WATCH MODE (intensive turning-point tracking) ────────────────────────────
+# /watch SYMBOL tracks a stock every 30s and alerts on every reversal of 0.5%
+# from the local extreme: top -> "ha girato" (sell signal), bottom -> "riparte".
+WATCH_TRAIL = 0.5  # % retracement from local extreme to trigger a turn alert
+watched: dict = {}  # yf_symbol -> {"mode","extreme","start","name"}
+
+def resolve_symbol(query: str):
+    """Map a user-typed name/ticker to the yfinance symbol in the portfolio."""
+    q = query.strip().upper()
+    for sym in PORTFOLIO:
+        if sym.upper() == q:
+            return sym
+    for sym in PORTFOLIO:
+        if sym.upper().split(".")[0] == q:
+            return sym
+    for sym, (name, _) in PORTFOLIO_DATA.items():
+        if name.upper() == q or name.upper().startswith(q):
+            return sym
+    return None
 
 # ─── NEWS IDS PERSISTENCE ─────────────────────────────────────────────────────
 def load_sent_news_ids() -> set:
@@ -166,8 +194,18 @@ def poll_telegram_commands():
                 threading.Thread(target=morning_briefing, daemon=True).start()
             elif text == "/ny":
                 threading.Thread(target=ny_summary, daemon=True).start()
+            elif text.startswith("/watch"):
+                arg = raw.strip()[6:].strip()
+                if arg:
+                    threading.Thread(target=watch_start, args=(arg,), daemon=True).start()
+                else:
+                    threading.Thread(target=watch_status, daemon=True).start()
+            elif text.startswith("/unwatch"):
+                arg = raw.strip()[8:].strip() or "all"
+                threading.Thread(target=watch_stop, args=(arg,), daemon=True).start()
+            elif text in ("/watching", "/watchlist"):
+                threading.Thread(target=watch_status, daemon=True).start()
             elif raw.strip() and not raw.startswith("/"):
-                # Free-form question
                 threading.Thread(target=answer_question, args=(raw.strip(),), daemon=True).start()
     except Exception as e:
         print(f"Command poll error: {e}")
@@ -335,12 +373,21 @@ def process_price(symbol: str, price: float):
     if symbol not in PORTFOLIO:
         return
     now = time.time()
+
+    # First price after (re)start may be stale — record it but skip alert check
+    if symbol not in warmed_up:
+        warmed_up.add(symbol)
+        price_history[symbol].append((now, price))
+        print(f"Warmup {symbol}: {price} (seeded, no alert check)")
+        return
+
     price_history[symbol].append((now, price))
     if now - last_alert_time.get(symbol, 0) < ALERT_COOLDOWN:
         return
 
     name       = PORTFOLIO[symbol]
     is_quantum = symbol in QUANTUM_STOCKS
+    threshold  = CUSTOM_THRESHOLDS.get(symbol, DROP_THRESHOLD)
     levels = [
         (5*60,  "EMERGENCY",     "🚨", "ROCKET",      "🚀", True),
         (10*60, "ALLERTA ROSSA", "🔴", "VERDE FORTE", "💚", not is_quantum),
@@ -358,12 +405,12 @@ def process_price(symbol: str, price: float):
         pct  = (price - ref) / ref * 100
         mins = max(1, int((now - wp[0][0]) / 60))
 
-        if pct <= -DROP_THRESHOLD:
-            send_telegram(f"{de} <b>{dl} — {name}</b>\n\n📉 {pct:+.1f}% in {mins} min\nDa {ref:.2f} → {price:.2f}")
+        if pct <= -threshold:
+            send_telegram(f"{de} <b>{dl} — {name}</b>\n\n📉 {pct:+.1f}% in {mins} min (soglia {threshold:.1f}%)\nDa {ref:.2f} → {price:.2f}")
             last_alert_time[symbol] = now
             return
-        if pct >= DROP_THRESHOLD:
-            send_telegram(f"{re} <b>{rl} — {name}</b>\n\n📈 +{pct:.1f}% in {mins} min\nDa {ref:.2f} → {price:.2f}")
+        if pct >= threshold:
+            send_telegram(f"{re} <b>{rl} — {name}</b>\n\n📈 +{pct:.1f}% in {mins} min (soglia {threshold:.1f}%)\nDa {ref:.2f} → {price:.2f}")
             last_alert_time[symbol] = now
             return
 
@@ -399,18 +446,125 @@ def start_ws():
     threading.Thread(target=ws.run_forever, daemon=True).start()
 
 # ─── EU STOCK POLLING (Twelve Data, every 5 min) ──────────────────────────────
-def poll_eu_stocks():
-    """Real-time EU price polling using fast_info.last_price — near real-time."""
-    eu = [s for s in PORTFOLIO if "." in s]
-    for symbol in eu:
+def _poll_symbols(symbols: list, tag: str = ""):
+    for symbol in symbols:
         try:
             price = yf.Ticker(symbol).fast_info.last_price
             if price and price > 0:
                 process_price(symbol, float(price))
-                print(f"Poll {symbol}: {price}")
+                print(f"Poll{tag} {symbol}: {price}")
         except Exception as e:
             print(f"Poll error {symbol}: {e}")
         time.sleep(0.1)
+
+def poll_eu_stocks():
+    """Real-time EU price polling using fast_info.last_price — every 5 min."""
+    eu = [s for s in PORTFOLIO if "." in s and s not in FAST_POLL_SYMBOLS]
+    _poll_symbols(eu)
+
+def poll_fast_stocks():
+    """High-frequency polling for large/watched positions — every 2 min."""
+    _poll_symbols(list(FAST_POLL_SYMBOLS), tag=" (fast)")
+
+# --- WATCH: start / stop / status ---
+def watch_start(query: str):
+    sym = resolve_symbol(query)
+    if not sym:
+        send_telegram(f"Non riconosco \"{query}\". Usa il ticker (es. ASML) o il nome.")
+        return
+    try:
+        price = float(yf.Ticker(sym).fast_info.last_price)
+    except Exception:
+        price = 0
+    if not price:
+        send_telegram(f"Non riesco a leggere il prezzo di {PORTFOLIO[sym]} ora. Riprova tra poco.")
+        return
+    name = PORTFOLIO[sym]
+    watched[sym] = {"mode": None, "extreme": price, "start": price, "name": name}
+    send_telegram(
+        f"\U0001F441 <b>Watch attivo - {name}</b>\n\n"
+        f"Prezzo ora: {price:.2f}\n"
+        f"Ti avviso a ogni inversione di {WATCH_TRAIL}% dal massimo (vendita) "
+        f"o dal minimo (ripartenza).\n"
+        f"Controllo ogni 30 secondi.\n\n"
+        f"Stop: /unwatch {sym.split('.')[0]}"
+    )
+
+def watch_stop(query: str):
+    sym = resolve_symbol(query)
+    if sym and sym in watched:
+        del watched[sym]
+        send_telegram(f"Watch disattivato su {PORTFOLIO[sym]}.")
+    elif query.strip().lower() in ("all", "tutto"):
+        watched.clear()
+        send_telegram("Watch disattivato su tutti i titoli.")
+    else:
+        send_telegram(f"Non c'e un watch attivo su \"{query}\".")
+
+def watch_status():
+    if not watched:
+        send_telegram("Nessun titolo in watch. Attiva con /watch ASML.")
+        return
+    lines = []
+    for sym, st in watched.items():
+        try:
+            p = float(yf.Ticker(sym).fast_info.last_price)
+        except Exception:
+            p = st["extreme"]
+        chg = (p - st["start"]) / st["start"] * 100
+        lines.append(f"{st['name']}: {p:.2f} ({chg:+.1f}% da inizio watch)")
+    send_telegram("\U0001F441 <b>In watch</b>\n\n" + "\n".join(lines))
+
+# --- WATCH POLLER (every 30s) ---
+def poll_watched():
+    if not watched:
+        return
+    for sym, st in list(watched.items()):
+        try:
+            price = float(yf.Ticker(sym).fast_info.last_price)
+        except Exception as e:
+            print(f"Watch poll error {sym}: {e}")
+            continue
+        if not price:
+            continue
+
+        name = st["name"]
+        mode = st["mode"]
+        ext  = st["extreme"]
+
+        if mode is None:
+            if price > st["start"]:
+                st["mode"], st["extreme"] = "rising", price
+            elif price < st["start"]:
+                st["mode"], st["extreme"] = "falling", price
+            print(f"Watch {sym} init {st['mode']} @ {price}")
+            continue
+
+        if mode == "rising":
+            if price > ext:
+                st["extreme"] = price
+            elif price <= ext * (1 - WATCH_TRAIL / 100):
+                drop = (price - ext) / ext * 100
+                send_telegram(
+                    f"\U0001F53B <b>{name} HA GIRATO</b>\n\n"
+                    f"Max {ext:.2f} -> ora {price:.2f} ({drop:+.1f}%)\n"
+                    f"Possibile inversione - valuta vendita."
+                )
+                st["mode"], st["extreme"] = "falling", price
+                print(f"Watch {sym} TURN DOWN {ext}->{price}")
+
+        elif mode == "falling":
+            if price < ext:
+                st["extreme"] = price
+            elif price >= ext * (1 + WATCH_TRAIL / 100):
+                rise = (price - ext) / ext * 100
+                send_telegram(
+                    f"\U0001F53A <b>{name} RIPARTE</b>\n\n"
+                    f"Min {ext:.2f} -> ora {price:.2f} ({rise:+.1f}%)\n"
+                    f"Possibile ripresa al rialzo."
+                )
+                st["mode"], st["extreme"] = "rising", price
+                print(f"Watch {sym} TURN UP {ext}->{price}")
 
 # ─── NEWS ALERTS ──────────────────────────────────────────────────────────────
 def is_relevant_news(headline: str, summary: str) -> bool:
@@ -429,7 +583,7 @@ def is_relevant_news(headline: str, summary: str) -> bool:
         )
         score = int(msg.content[0].text.strip())
         print(f"News {score}/10: {headline[:50]}")
-        return score >= 6
+        return score >= 7
     except Exception as e:
         print(f"News filter error: {e}")
         return False
@@ -645,6 +799,7 @@ In italiano. Solo fatti e numeri."""
 # ─── DAILY RESET ──────────────────────────────────────────────────────────────
 def daily_reset():
     last_alert_time.clear()
+    warmed_up.clear()
     for s in price_history:
         price_history[s].clear()
     # Keep sent_news_ids in memory (already persisted on disk)
@@ -661,6 +816,8 @@ if __name__ == "__main__":
     schedule.every().day.at("17:30").do(eu_close_summary)
     schedule.every().day.at("22:00").do(us_close_summary)
     schedule.every(5).minutes.do(poll_eu_stocks)
+    schedule.every(2).minutes.do(poll_fast_stocks)
+    schedule.every(30).seconds.do(poll_watched)
     schedule.every(1).hours.do(check_news_alerts)
     schedule.every(1).minutes.do(poll_telegram_commands)
     schedule.every().day.at("00:01").do(daily_reset)
@@ -672,7 +829,8 @@ if __name__ == "__main__":
         "17:30  Chiusura EU\n"
         "22:00  Chiusura US\n\n"
         "Alert: real-time ±2% (velocità)\n"
-        "Comandi: /morning /ny /summary /us"
+        "Comandi: /morning /ny /summary /us\n"
+        "Watch turning-point: /watch ASML  -  /unwatch ASML"
     )
 
     while True:
