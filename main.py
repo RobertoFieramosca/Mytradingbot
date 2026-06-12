@@ -105,6 +105,46 @@ def send_telegram(message: str):
     except Exception as e:
         print(f"Telegram error: {e}")
 
+def answer_question(question: str):
+    """Free-form Q&A — Claude answers using live portfolio data as context."""
+    try:
+        send_telegram("Un momento, controllo i dati...")
+
+        quotes = get_quotes_yf(list(PORTFOLIO_DATA.keys()))
+        lines  = []
+        for symbol, (name, sector) in PORTFOLIO_DATA.items():
+            q = quotes.get(symbol, {})
+            c, pc = q.get("c", 0), q.get("pc", 0)
+            if c and pc:
+                pct  = (c - pc) / pc * 100
+                sign = "+" if pct >= 0 else ""
+                lines.append(f"{name} ({sector}): {c:.2f} ({sign}{pct:.1f}%)")
+            else:
+                lines.append(f"{name} ({sector}): N/A")
+
+        portfolio_str = "\n".join(lines)
+        news_str      = "\n".join(f"- {n['headline']}" for n in get_market_news()[:8])
+
+        prompt = f"""Sei l\'assistente trading personale di Roberto. Ti fa una domanda diretta.
+
+PORTAFOGLIO ATTUALE (prezzo e variazione % da ieri):
+{portfolio_str}
+
+NEWS DI MERCATO RECENTI:
+{news_str}
+
+DOMANDA DI ROBERTO:
+{question}
+
+Rispondi in modo diretto e professionale, max 200 parole. Se la domanda riguarda un titolo specifico
+e hai i dati, usa i numeri reali sopra. Se serve una news specifica che non hai,
+dillo onestamente invece di inventare. Tono professionale, in italiano, niente fronzoli."""
+
+        answer = claude_analyze(prompt, max_tokens=600)
+        send_telegram(answer)
+    except Exception as e:
+        send_telegram(f"Errore: {e}")
+
 def poll_telegram_commands():
     global last_update_id
     try:
@@ -115,7 +155,9 @@ def poll_telegram_commands():
         ).json()
         for update in r.get("result", []):
             last_update_id = update["update_id"]
-            text = update.get("message", {}).get("text", "").strip().lower()
+            raw  = update.get("message", {}).get("text", "")
+            text = raw.strip().lower()
+
             if text in ("/summary", "/eu"):
                 threading.Thread(target=eu_close_summary, daemon=True).start()
             elif text == "/us":
@@ -124,6 +166,9 @@ def poll_telegram_commands():
                 threading.Thread(target=morning_briefing, daemon=True).start()
             elif text == "/ny":
                 threading.Thread(target=ny_summary, daemon=True).start()
+            elif raw.strip() and not raw.startswith("/"):
+                # Free-form question
+                threading.Thread(target=answer_question, args=(raw.strip(),), daemon=True).start()
     except Exception as e:
         print(f"Command poll error: {e}")
 
