@@ -194,17 +194,16 @@ def poll_telegram_commands():
                 threading.Thread(target=morning_briefing, daemon=True).start()
             elif text == "/ny":
                 threading.Thread(target=ny_summary, daemon=True).start()
-            elif text.startswith("/watch"):
-                arg = raw.strip()[6:].strip()
-                if arg:
-                    threading.Thread(target=watch_start, args=(arg,), daemon=True).start()
-                else:
-                    threading.Thread(target=watch_status, daemon=True).start()
-            elif text.startswith("/unwatch"):
-                arg = raw.strip()[8:].strip() or "all"
-                threading.Thread(target=watch_stop, args=(arg,), daemon=True).start()
-            elif text in ("/watching", "/watchlist"):
+            elif text in ("/watching", "/watchlist", "/watch"):
                 threading.Thread(target=watch_status, daemon=True).start()
+            elif text == "/unwatch":
+                threading.Thread(target=watch_stop, args=("all",), daemon=True).start()
+            elif text.startswith("/unwatch "):
+                arg = raw.strip().split(None, 1)[1]
+                threading.Thread(target=watch_stop, args=(arg,), daemon=True).start()
+            elif text.startswith("/watch "):
+                arg = raw.strip().split(None, 1)[1]
+                threading.Thread(target=watch_start, args=(arg,), daemon=True).start()
             elif raw.strip() and not raw.startswith("/"):
                 threading.Thread(target=answer_question, args=(raw.strip(),), daemon=True).start()
     except Exception as e:
@@ -472,10 +471,7 @@ def watch_start(query: str):
     if not sym:
         send_telegram(f"Non riconosco \"{query}\". Usa il ticker (es. ASML) o il nome.")
         return
-    try:
-        price = float(yf.Ticker(sym).fast_info.last_price)
-    except Exception:
-        price = 0
+    price = get_realtime_price(sym)
     if not price:
         send_telegram(f"Non riesco a leggere il prezzo di {PORTFOLIO[sym]} ora. Riprova tra poco.")
         return
@@ -507,25 +503,68 @@ def watch_status():
         return
     lines = []
     for sym, st in watched.items():
-        try:
-            p = float(yf.Ticker(sym).fast_info.last_price)
-        except Exception:
-            p = st["extreme"]
+        p = get_realtime_price(sym) or st["extreme"]
         chg = (p - st["start"]) / st["start"] * 100
         lines.append(f"{st['name']}: {p:.2f} ({chg:+.1f}% da inizio watch)")
     send_telegram("\U0001F441 <b>In watch</b>\n\n" + "\n".join(lines))
+
+# Twelve Data real-time price for a single symbol (Cboe Europe = no 15min delay)
+# Map yfinance EU suffixes to Twelve Data exchange-suffixed symbols
+TD_RT_MAP = {
+    "ASML.AS":  "ASML:AS",
+    "RMS.PA":   "RMS:PA",
+    "AIR.PA":   "AIR:PA",
+    "MC.PA":    "MC:PA",
+    "UCG.MI":   "UCG:MI",
+    "EL.PA":    "EL:PA",
+    "CDI.PA":   "CDI:PA",
+    "ADYEN.AS": "ADYEN:AS",
+    "DSY.PA":   "DSY:PA",
+    "ENGI.PA":  "ENGI:PA",
+    "DTE.DE":   "DTE:DE",
+    "ISP.MI":   "ISP:MI",
+    "SU.PA":    "SU:PA",
+    "ENR.DE":   "ENR:DE",
+    "ASM.AS":   "ASM:AS",
+}
+
+def get_realtime_price(symbol: str):
+    """
+    Real-time price for watch mode.
+    EU stocks -> Twelve Data (Cboe Europe, no delay).
+    US stocks -> Twelve Data US (real-time on free tier) or yfinance fallback.
+    Returns float or None.
+    """
+    td_sym = TD_RT_MAP.get(symbol, symbol if "." not in symbol else None)
+    if td_sym and TWELVEDATA_KEY:
+        try:
+            r = requests.get(
+                f"https://api.twelvedata.com/price?symbol={td_sym}&apikey={TWELVEDATA_KEY}",
+                timeout=10
+            ).json()
+            p = r.get("price")
+            if p:
+                return float(p)
+            else:
+                print(f"TD RT no price for {td_sym}: {r}")
+        except Exception as e:
+            print(f"TD RT error {td_sym}: {e}")
+    # Fallback to yfinance
+    try:
+        p = yf.Ticker(symbol).fast_info.last_price
+        return float(p) if p else None
+    except Exception as e:
+        print(f"RT fallback error {symbol}: {e}")
+        return None
 
 # --- WATCH POLLER (every 30s) ---
 def poll_watched():
     if not watched:
         return
     for sym, st in list(watched.items()):
-        try:
-            price = float(yf.Ticker(sym).fast_info.last_price)
-        except Exception as e:
-            print(f"Watch poll error {sym}: {e}")
-            continue
+        price = get_realtime_price(sym)
         if not price:
+            print(f"Watch: no price for {sym}")
             continue
 
         name = st["name"]
